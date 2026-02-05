@@ -2336,14 +2336,19 @@ def create_app() -> FastAPI:
             return _wrap_response(None, code=500, error=f"format_sample error: {str(e)}")
 
     @app.get("/v1/audio")
-    async def get_audio(path: str, _: None = Depends(verify_api_key)):
+    async def get_audio(path: str, request: Request, _: None = Depends(verify_api_key)):
         """Serve audio file by path."""
         from fastapi.responses import FileResponse
 
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail=f"Audio file not found: {path}")
+        # Security: Validate path is within allowed directory to prevent path traversal
+        resolved_path = os.path.realpath(path)
+        allowed_dir = os.path.realpath(request.app.state.temp_audio_dir)
+        if not resolved_path.startswith(allowed_dir + os.sep) and resolved_path != allowed_dir:
+            raise HTTPException(status_code=403, detail="Access denied: path outside allowed directory")
+        if not os.path.exists(resolved_path):
+            raise HTTPException(status_code=404, detail="Audio file not found")
 
-        ext = os.path.splitext(path)[1].lower()
+        ext = os.path.splitext(resolved_path)[1].lower()
         media_types = {
             ".mp3": "audio/mpeg",
             ".wav": "audio/wav",
@@ -2352,7 +2357,7 @@ def create_app() -> FastAPI:
         }
         media_type = media_types.get(ext, "audio/mpeg")
 
-        return FileResponse(path, media_type=media_type)
+        return FileResponse(resolved_path, media_type=media_type)
 
     return app
 

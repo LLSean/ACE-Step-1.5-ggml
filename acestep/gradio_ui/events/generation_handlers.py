@@ -144,6 +144,11 @@ def load_metadata(file_obj, llm_handler=None):
             audio_duration = -1
         
         batch_size = metadata.get('batch_size', 2)
+        # Clamp batch_size to GPU memory limit
+        gpu_config = get_global_gpu_config()
+        lm_initialized = llm_handler.llm_initialized if llm_handler else False
+        max_batch_size = gpu_config.max_batch_size_with_lm if lm_initialized else gpu_config.max_batch_size_without_lm
+        batch_size = min(int(batch_size), max_batch_size)
         inference_steps = metadata.get('inference_steps', 8)
         guidance_scale = metadata.get('guidance_scale', 7.0)
         seed = metadata.get('seed', '-1')
@@ -462,7 +467,7 @@ def init_service_wrapper(dit_handler, llm_handler, checkpoint, config_path, devi
             backend=backend,
             device=device,
             offload_to_cpu=offload_to_cpu,
-            dtype=dit_handler.dtype,
+            dtype=None,
         )
         
         if lm_success:
@@ -825,6 +830,7 @@ def handle_create_sample(
         - audio_duration
         - key_scale
         - vocal_language
+        - simple_vocal_language
         - time_signature
         - instrumental_checkbox
         - caption_accordion (open)
@@ -845,6 +851,7 @@ def handle_create_sample(
             gr.update(),  # audio_duration - no change
             gr.update(),  # key_scale - no change
             gr.update(),  # vocal_language - no change
+            gr.update(),  # simple vocal_language - no change
             gr.update(),  # time_signature - no change
             gr.update(),  # instrumental_checkbox - no change
             gr.update(),  # caption_accordion - no change
@@ -1048,4 +1055,3 @@ def handle_format_sample(
         True,  # is_format_caption_state - True (LM-formatted)
         result.status_message,  # status_output
     )
-

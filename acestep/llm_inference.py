@@ -56,6 +56,7 @@ class LLMHandler:
         self.device = "cpu"
         self.dtype = torch.float32
         self.offload_to_cpu = False
+        self.disable_tqdm = os.environ.get("ACESTEP_DISABLE_TQDM", "").lower() in ("1", "true", "yes") or not (hasattr(sys.stderr, 'isatty') and sys.stderr.isatty())
 
         # HuggingFace Space persistent storage support
         if persistent_storage_path is None and self.IS_HUGGINGFACE_SPACE:
@@ -71,6 +72,41 @@ class LLMHandler:
         # MLX model reference (used when llm_backend == "mlx")
         self._mlx_model = None
         self._mlx_model_path = None
+
+    def unload(self) -> None:
+        """Release LM weights/tokenizer and clear caches to free memory."""
+        try:
+            if self.llm_backend == "vllm":
+                try:
+                    if hasattr(self.llm, "reset"):
+                        self.llm.reset()
+                except Exception:
+                    pass
+            self.llm = None
+            self.llm_tokenizer = None
+            self.constrained_processor = None
+            self.llm_initialized = False
+            self.llm_backend = None
+            self._mlx_model = None
+            self._mlx_model_path = None
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+                if hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+                if hasattr(torch.mps, "empty_cache"):
+                    torch.mps.empty_cache()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+                torch.xpu.synchronize()
+        except Exception:
+            pass
 
     def _get_checkpoint_dir(self) -> str:
         """Get checkpoint directory, prioritizing persistent storage"""
@@ -349,7 +385,7 @@ class LLMHandler:
             checkpoint_dir: Checkpoint directory path
             lm_model_path: LM model path (relative to checkpoint_dir)
             backend: Backend type ("vllm" or "pt")
-            device: Device type ("auto", "cuda", or "cpu")
+            device: Device type ("auto", "cuda", "mps", "xpu", or "cpu")
             offload_to_cpu: Whether to offload to CPU
             dtype: Data type (if None, auto-detect based on device)
         
@@ -360,16 +396,46 @@ class LLMHandler:
             if device == "auto":
                 if torch.cuda.is_available():
                     device = "cuda"
-                elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-                    device = "xpu"
                 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                     device = "mps"
+                elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+                    device = "xpu"
                 else:
+                    device = "cpu"
+            elif device == "cuda" and not torch.cuda.is_available():
+                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    logger.warning("[initialize] CUDA requested but unavailable. Falling back to MPS.")
+                    device = "mps"
+                elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+                    logger.warning("[initialize] CUDA requested but unavailable. Falling back to XPU.")
+                    device = "xpu"
+                else:
+                    logger.warning("[initialize] CUDA requested but unavailable. Falling back to CPU.")
+                    device = "cpu"
+            elif device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+                if torch.cuda.is_available():
+                    logger.warning("[initialize] MPS requested but unavailable. Falling back to CUDA.")
+                    device = "cuda"
+                elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+                    logger.warning("[initialize] MPS requested but unavailable. Falling back to XPU.")
+                    device = "xpu"
+                else:
+                    logger.warning("[initialize] MPS requested but unavailable. Falling back to CPU.")
+                    device = "cpu"
+            elif device == "xpu" and not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+                if torch.cuda.is_available():
+                    logger.warning("[initialize] XPU requested but unavailable. Falling back to CUDA.")
+                    device = "cuda"
+                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    logger.warning("[initialize] XPU requested but unavailable. Falling back to MPS.")
+                    device = "mps"
+                else:
+                    logger.warning("[initialize] XPU requested but unavailable. Falling back to CPU.")
                     device = "cpu"
 
             self.device = device
             self.offload_to_cpu = offload_to_cpu
-            
+
             # Set dtype based on device: bfloat16 for cuda/xpu, float32 for mps/cpu
             # Note: LLM stays in float32 on MPS because autoregressive generation is
             # latency-bound (not compute-bound), and many LLM weights trained in bfloat16
@@ -382,6 +448,12 @@ class LLMHandler:
                     self.dtype = torch.float32
             else:
                 self.dtype = dtype
+                # Keep LM in float32 on MPS for stability.
+                if device == "mps" and self.dtype != torch.float32:
+                    logger.warning(
+                        f"[initialize] Overriding requested dtype {self.dtype} to float32 for LM on MPS."
+                    )
+                    self.dtype = torch.float32
 
             # If lm_model_path is None, use default
             if lm_model_path is None:
@@ -419,8 +491,7 @@ class LLMHandler:
             
             # Disable CUDA/HIP graph capture on ROCm (unverified on RDNA3 Windows)
             is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
-            if is_rocm:
-                disable_cuda_graphs = True
+            enforce_eager_for_vllm = bool(is_rocm)
 
             # Auto-detect best backend on Apple Silicon
             if backend == "mlx" or (backend == "vllm" and device == "mps"):
@@ -450,10 +521,19 @@ class LLMHandler:
                     status_msg = f"✅ 5Hz LM initialized (PyTorch fallback, MLX not available)\nModel: {full_lm_model_path}\nBackend: PyTorch"
                     return status_msg, True
 
+            if backend == "vllm" and device != "cuda":
+                logger.warning(
+                    f"[initialize] vllm backend requires CUDA. Falling back to PyTorch backend for device={device}."
+                )
+                backend = "pt"
+
             # Initialize based on user-selected backend
             if backend == "vllm":
                 _warn_if_prerelease_python()
-                status_msg = self._initialize_5hz_lm_vllm(full_lm_model_path, enforce_eager=False)
+                status_msg = self._initialize_5hz_lm_vllm(
+                    full_lm_model_path,
+                    enforce_eager=enforce_eager_for_vllm,
+                )
                 logger.info(f"5Hz LM status message: {status_msg}")
                 # Check if initialization failed (status_msg starts with ❌)
                 if status_msg.startswith("❌"):
@@ -775,7 +855,7 @@ class LLMHandler:
                 )
             else:
                 # Generate without CFG using native generate() parameters
-                with torch.no_grad():
+                with torch.inference_mode():
                     outputs = self.llm.generate(
                         **inputs,
                         max_new_tokens=max_new_tokens,
@@ -810,7 +890,7 @@ class LLMHandler:
         generated_ids = generated_ids[input_length:]
         
         # Move to CPU for decoding (tokenizer needs CPU tensors)
-        if not generated_ids.is_cpu:
+        if generated_ids.device.type != "cpu":
             generated_ids = generated_ids.cpu()
         
         output_text = self.llm_tokenizer.decode(generated_ids, skip_special_tokens=False)
@@ -2189,8 +2269,8 @@ class LLMHandler:
         # Build logits processor for repetition penalty
         logits_processor = self._build_logits_processor(repetition_penalty)
         
-        with torch.no_grad():
-            for step in tqdm(range(max_new_tokens), desc="LLM Constrained Decoding", unit="token"):
+        with torch.inference_mode():
+            for step in tqdm(range(max_new_tokens), desc="LLM Constrained Decoding", unit="token", disable=self.disable_tqdm):
                 # Forward pass
                 outputs = self._forward_pass(model, generated_ids, model_kwargs, past_key_values, use_cache)
                 
@@ -2294,8 +2374,8 @@ class LLMHandler:
         # Build logits processor for non-CFG operations (repetition penalty, top_k, top_p)
         logits_processor = self._build_logits_processor(repetition_penalty)
         
-        with torch.no_grad():
-            for step in tqdm(range(max_new_tokens), desc="LLM CFG Generation", unit="token"):
+        with torch.inference_mode():
+            for step in tqdm(range(max_new_tokens), desc="LLM CFG Generation", unit="token", disable=self.disable_tqdm):
                 # Forward pass for the entire batch (conditional + unconditional)
                 outputs = self._forward_pass(model, generated_ids, model_kwargs, past_key_values, use_cache)
                 
@@ -2512,10 +2592,54 @@ class LLMHandler:
             logger.info(f"Loading MLX model from {model_path}")
             start_time = time.time()
 
-            # mlx-lm's load() can read HuggingFace safetensors directly
-            # It uses config.json to determine model architecture (e.g., Qwen3)
-            # and the model's sanitize() method handles weight key remapping
-            self._mlx_model, _ = mlx_load(model_path)
+            # Try standard mlx-lm load first
+            try:
+                self._mlx_model, _ = mlx_load(model_path)
+            except Exception as first_err:
+                # The ACE-Step 5Hz LM checkpoints store safetensors keys without
+                # the "model." prefix (e.g. "layers.0.xxx" instead of
+                # "model.layers.0.xxx") which is what mlx-lm's Qwen3 model
+                # expects.  When the standard load fails we retry with the
+                # prefix remapped.
+                logger.info(
+                    f"Standard MLX load failed ({first_err}), "
+                    "retrying with 'model.' prefix remapping..."
+                )
+                import glob as _glob
+                from pathlib import Path
+                from mlx_lm.utils import load_model, load_config, load_tokenizer, _get_classes
+
+                _model_path = Path(model_path)
+                config = load_config(_model_path)
+
+                # Load raw weights from safetensors
+                weight_files = _glob.glob(str(_model_path / "model*.safetensors"))
+                if not weight_files:
+                    raise FileNotFoundError(f"No safetensors found in {model_path}") from first_err
+
+                weights = {}
+                for wf in weight_files:
+                    weights.update(mx.load(wf))
+
+                # Check if keys need "model." prefix by inspecting first key
+                sample_key = next(iter(weights))
+                if not sample_key.startswith("model."):
+                    logger.info("Adding 'model.' prefix to weight keys for MLX compatibility")
+                    weights = {f"model.{k}": v for k, v in weights.items()}
+
+                # Build model from config
+                model_class, model_args_class = _get_classes(config=config)
+                model_args = model_args_class.from_dict(config)
+                model = model_class(model_args)
+
+                if hasattr(model, "sanitize"):
+                    weights = model.sanitize(weights)
+
+                model.load_weights(list(weights.items()), strict=True)
+                mx.eval(model.parameters())
+                model.eval()
+                self._mlx_model = model
+
             mx.eval(self._mlx_model.parameters())
             # Store model path for get_hf_model_for_scoring
             self._mlx_model_path = model_path
@@ -3253,7 +3377,9 @@ class LLMHandler:
             # Clear accelerator cache after offloading
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
                 torch.mps.empty_cache()
             offload_time = time.time() - start_time
             logger.info(f"Offloaded LLM to CPU in {offload_time:.4f}s")

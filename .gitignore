@@ -241,3 +241,4 @@ PortableGit/
 proxy_config.txt
 gradio_outputs/
 acestep/third_parts/vllm/
+test_lora_scale_fix.py

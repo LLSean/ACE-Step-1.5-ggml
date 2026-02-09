@@ -362,6 +362,8 @@ PARAM_ALIASES = {
     "seed": ["seed"],
 
     "audio_cover_strength": ["audio_cover_strength", "audioCoverStrength"],
+    "reference_audio_path": ["reference_audio_path", "ref_audio_path", "referenceAudioPath", "refAudioPath"],
+    "src_audio_path": ["src_audio_path", "ctx_audio_path", "sourceAudioPath", "srcAudioPath", "ctxAudioPath"],
     "task_type": ["task_type", "taskType"],
     "infer_method": ["infer_method", "inferMethod"],
     "use_tiled_decode": ["use_tiled_decode", "useTiledDecode"],
@@ -585,6 +587,9 @@ class _JobRecord:
     progress_text: str = ""
     status_text: str = ""
     env: str = "development"
+    progress: float = 0.0  # 0.0 - 1.0
+    stage: str = "queued"
+    updated_at: Optional[float] = None
     # OpenRouter integration: synchronous wait / streaming support
     done_event: Optional[asyncio.Event] = None
     progress_queue: Optional[asyncio.Queue] = None
@@ -598,18 +603,23 @@ class _JobStore:
 
     def create(self) -> _JobRecord:
         job_id = str(uuid4())
-        rec = _JobRecord(job_id=job_id, status="queued", created_at=time.time())
+        now = time.time()
+        rec = _JobRecord(job_id=job_id, status="queued", created_at=now, progress=0.0, stage="queued", updated_at=now)
         with self._lock:
             self._jobs[job_id] = rec
         return rec
 
     def create_with_id(self, job_id: str, env: str = "development") -> _JobRecord:
         """Create job record with specified ID"""
+        now = time.time()
         rec = _JobRecord(
             job_id=job_id,
             status="queued",
-            created_at=time.time(),
-            env=env
+            created_at=now,
+            env=env,
+            progress=0.0,
+            stage="queued",
+            updated_at=now,
         )
         with self._lock:
             self._jobs[job_id] = rec
@@ -624,6 +634,9 @@ class _JobStore:
             rec = self._jobs[job_id]
             rec.status = "running"
             rec.started_at = time.time()
+            rec.progress = max(rec.progress, 0.01)
+            rec.stage = "running"
+            rec.updated_at = time.time()
 
     def mark_succeeded(self, job_id: str, result: Dict[str, Any]) -> None:
         with self._lock:
@@ -632,6 +645,9 @@ class _JobStore:
             rec.finished_at = time.time()
             rec.result = result
             rec.error = None
+            rec.progress = 1.0
+            rec.stage = "succeeded"
+            rec.updated_at = time.time()
 
     def mark_failed(self, job_id: str, error: str) -> None:
         with self._lock:
@@ -640,6 +656,19 @@ class _JobStore:
             rec.finished_at = time.time()
             rec.result = None
             rec.error = error
+            rec.progress = rec.progress if rec.progress > 0 else 0.0
+            rec.stage = "failed"
+            rec.updated_at = time.time()
+
+    def update_progress(self, job_id: str, progress: float, stage: Optional[str] = None) -> None:
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                return
+            rec.progress = max(0.0, min(1.0, float(progress)))
+            if stage:
+                rec.stage = stage
+            rec.updated_at = time.time()
 
     def cleanup_old_jobs(self, max_age_seconds: Optional[int] = None) -> int:
         """
@@ -699,6 +728,8 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 
 
 def _get_model_name(config_path: str) -> str:
@@ -856,6 +887,25 @@ class RequestParser:
 
     def bool(self, name: str, default: bool = False) -> bool:
         return _to_bool(self.get(name), default)
+
+
+def _validate_audio_path(path: Optional[str]) -> Optional[str]:
+    """Validate a user-supplied audio file path to prevent path traversal attacks.
+
+    Rejects absolute paths and paths containing '..' traversal sequences.
+    Returns the validated path or None if the input is None/empty.
+    Raises HTTPException 400 if the path is unsafe.
+    """
+    if not path:
+        return None
+    # Reject absolute paths (Unix and Windows)
+    if os.path.isabs(path):
+        raise HTTPException(status_code=400, detail="absolute audio file paths are not allowed")
+    # Reject path traversal via '..' components
+    normalized = os.path.normpath(path)
+    if ".." in normalized.split(os.sep):
+        raise HTTPException(status_code=400, detail="path traversal in audio file paths is not allowed")
+    return path
 
 
 async def _save_upload_to_temp(upload: StarletteUploadFile, *, prefix: str) -> str:
@@ -1106,6 +1156,8 @@ def create_app() -> FastAPI:
                                 "seed_value": seed_value,
                                 "lm_model": lm_model,
                                 "dit_model": dit_model,
+                                "progress": 1.0,
+                                "stage": "succeeded",
                             }
                             for p in audio_paths
                         ]
@@ -1123,11 +1175,43 @@ def create_app() -> FastAPI:
                             "seed_value": seed_value,
                             "lm_model": lm_model,
                             "dit_model": dit_model,
+                            "progress": 1.0,
+                            "stage": "succeeded",
                         }]
             else:
-                # Failed or other status - include error from job store
-                error_msg = rec.error if rec and rec.error else None
-                result_data = [{"file": "", "wave": "", "status": status_int, "create_time": int(create_time), "env": env, "error": error_msg}]
+                result_data = [{
+                    "file": "",
+                    "wave": "",
+                    "status": status_int,
+                    "create_time": int(create_time),
+                    "env": env,
+                    "progress": 0.0,
+                    "stage": "failed" if status == "failed" else status,
+                }]
+
+            result_key = f"{RESULT_KEY_PREFIX}{job_id}"
+            local_cache.set(result_key, result_data, ex=RESULT_EXPIRE_SECONDS)
+
+        def _update_local_cache_progress(job_id: str, progress: float, stage: str) -> None:
+            """Update local cache with job progress for queued/running states."""
+            local_cache = getattr(app.state, 'local_cache', None)
+            if not local_cache:
+                return
+
+            rec = store.get(job_id)
+            env = getattr(rec, 'env', 'development') if rec else 'development'
+            create_time = rec.created_at if rec else time.time()
+            status_int = _map_status("running")
+
+            result_data = [{
+                "file": "",
+                "wave": "",
+                "status": status_int,
+                "create_time": int(create_time),
+                "env": env,
+                "progress": float(progress),
+                "stage": stage,
+            }]
 
             result_key = f"{RESULT_KEY_PREFIX}{job_id}"
             local_cache.set(result_key, result_data, ex=RESULT_EXPIRE_SECONDS)
@@ -1139,6 +1223,7 @@ def create_app() -> FastAPI:
 
             await _ensure_initialized()
             job_store.mark_running(job_id)
+            _update_local_cache_progress(job_id, 0.01, "running")
             
             # Select DiT handler based on user's model choice
             # Default: use primary handler
@@ -1187,6 +1272,7 @@ def create_app() -> FastAPI:
                         had_error = getattr(app.state, "_llm_init_error", None)
                         if initialized or had_error is not None:
                             return
+                        print("[API Server] reloading.")
 
                         # Check if lazy loading is disabled (GPU memory insufficient)
                         if getattr(app.state, "_llm_lazy_load_disabled", False):
@@ -1222,7 +1308,7 @@ def create_app() -> FastAPI:
                             backend=backend,
                             device=lm_device,
                             offload_to_cpu=lm_offload,
-                            dtype=h.dtype,
+                            dtype=None,
                         )
                         if not ok:
                             app.state._llm_init_error = status
@@ -1257,7 +1343,19 @@ def create_app() -> FastAPI:
                 use_format = bool(req.use_format)
                 use_cot_caption = bool(req.use_cot_caption)
                 use_cot_language = bool(req.use_cot_language)
+
                 full_analysis_only = bool(req.full_analysis_only)
+
+                # Unload LM for cover tasks on MPS to reduce memory; reload lazily when needed.
+                if req.task_type == "cover" and h.device == "mps":
+                    if getattr(app.state, "_llm_initialized", False) and getattr(llm, "llm_initialized", False):
+                        try:
+                            print("[API Server] unloading.")
+                            llm.unload()
+                            app.state._llm_initialized = False
+                            app.state._llm_init_error = None
+                        except Exception as e:
+                            print(f"[API Server] Failed to unload LM: {e}")
 
                 # LLM is REQUIRED for these features (fail if unavailable):
                 # - thinking mode (LM generates audio codes)
@@ -1456,12 +1554,34 @@ def create_app() -> FastAPI:
                 llm_is_initialized = getattr(app.state, "_llm_initialized", False)
                 llm_to_pass = llm if llm_is_initialized else None
 
+                # Progress callback for API polling
+                last_progress = {"value": -1.0, "time": 0.0, "stage": ""}
+
+                def _progress_cb(value: float, desc: str = "") -> None:
+                    now = time.time()
+                    try:
+                        value_f = max(0.0, min(1.0, float(value)))
+                    except Exception:
+                        value_f = 0.0
+                    stage = desc or last_progress["stage"] or "running"
+                    # Throttle updates to avoid excessive cache writes
+                    if (
+                        value_f - last_progress["value"] >= 0.01
+                        or stage != last_progress["stage"]
+                        or (now - last_progress["time"]) >= 0.5
+                    ):
+                        last_progress["value"] = value_f
+                        last_progress["time"] = now
+                        last_progress["stage"] = stage
+                        job_store.update_progress(job_id, value_f, stage=stage)
+                        _update_local_cache_progress(job_id, value_f, stage)
+
                 if req.full_analysis_only:
                     store.update_progress_text(job_id, "Starting Deep Analysis...")
                     # Step A: Convert source audio to semantic codes
                     # We use params.src_audio which is the server-side path
                     audio_codes = h.convert_src_audio_to_codes(params.src_audio)
-                    
+
                     if not audio_codes or audio_codes.startswith("❌"):
                         raise RuntimeError(f"Audio encoding failed: {audio_codes}")
 
@@ -1473,7 +1593,7 @@ def create_app() -> FastAPI:
                         use_constrained_decoding=True,
                         constrained_decoding_debug=config.constrained_decoding_debug
                     )
-                    
+
                     if not metadata_dict:
                         raise RuntimeError(f"LLM Understanding failed: {status_string}")
 
@@ -1525,14 +1645,66 @@ def create_app() -> FastAPI:
                     }
 
                 # Generate music using unified interface
-                result = generate_music(
-                    dit_handler=h,
-                    llm_handler=llm_to_pass,
-                    params=params,
-                    config=config,
-                    save_dir=app.state.temp_audio_dir,
-                    progress=None,
-                )
+                sequential_runs = 1
+                if req.task_type == "cover" and h.device == "mps":
+                    # If user asked for multiple outputs, run sequentially on MPS to avoid OOM.
+                    if config.batch_size is not None and config.batch_size > 1:
+                        sequential_runs = int(config.batch_size)
+                        config.batch_size = 1
+                        print(f"[API Server] Job {job_id}: MPS cover sequential mode enabled (runs={sequential_runs})")
+
+                def _progress_for_slice(start: float, end: float):
+                    base = {"seen": False, "value": 0.0}
+                    def _cb(value: float, desc: str = "") -> None:
+                        try:
+                            value_f = max(0.0, min(1.0, float(value)))
+                        except Exception:
+                            value_f = 0.0
+                        if not base["seen"]:
+                            base["seen"] = True
+                            base["value"] = value_f
+                        # Normalize progress to avoid initial jump (e.g., 0.51 -> 0.0)
+                        if value_f <= base["value"]:
+                            norm = 0.0
+                        else:
+                            denom = max(1e-6, 1.0 - base["value"])
+                            norm = min(1.0, (value_f - base["value"]) / denom)
+                        mapped = start + (end - start) * norm
+                        _progress_cb(mapped, desc=desc)
+                    return _cb
+
+                aggregated_result = None
+                all_audios: List[Dict[str, Any]] = []
+                for run_idx in range(sequential_runs):
+                    if sequential_runs > 1:
+                        print(f"[API Server] Job {job_id}: Sequential cover run {run_idx + 1}/{sequential_runs}")
+                    if sequential_runs > 1:
+                        start = run_idx / sequential_runs
+                        end = (run_idx + 1) / sequential_runs
+                        progress_cb = _progress_for_slice(start, end)
+                    else:
+                        progress_cb = _progress_cb
+
+                    result = generate_music(
+                        dit_handler=h,
+                        llm_handler=llm_to_pass,
+                        params=params,
+                        config=config,
+                        save_dir=app.state.temp_audio_dir,
+                        progress=progress_cb,
+                    )
+                    if not result.success:
+                        raise RuntimeError(f"Music generation failed: {result.error or result.status_message}")
+
+                    if aggregated_result is None:
+                        aggregated_result = result
+                    all_audios.extend(result.audios)
+
+                # Use aggregated result with combined audios
+                if aggregated_result is None:
+                    raise RuntimeError("Music generation failed: no results")
+                aggregated_result.audios = all_audios
+                result = aggregated_result
 
                 if not result.success:
                     raise RuntimeError(f"Music generation failed: {result.error or result.status_message}")
@@ -1642,6 +1814,16 @@ def create_app() -> FastAPI:
                 # Update local cache
                 _update_local_cache(job_id, None, "failed")
             finally:
+                # Best-effort cache cleanup to reduce MPS memory fragmentation between jobs
+                try:
+                    if hasattr(h, "_empty_cache"):
+                        h._empty_cache()
+                    else:
+                        import torch
+                        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                            torch.mps.empty_cache()
+                except Exception:
+                    pass
                 dt = max(0.0, time.time() - t0)
                 async with app.state.stats_lock:
                     app.state.recent_durations.append(dt)
@@ -1933,7 +2115,7 @@ def create_app() -> FastAPI:
                 backend=lm_backend,
                 device=lm_device,
                 offload_to_cpu=lm_offload,
-                dtype=handler.dtype,
+                dtype=None,
             )
             if llm_ok:
                 app.state._llm_initialized = True
@@ -1988,6 +2170,10 @@ def create_app() -> FastAPI:
 
         def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
             """Build GenerateMusicRequest from parsed parameters."""
+            # Pop audio path overrides from kwargs to avoid duplicate keyword arguments
+            # when callers (multipart/form, url-encoded, raw body) pass them explicitly.
+            ref_audio = kwargs.pop("reference_audio_path", None) or p.str("reference_audio_path") or None
+            src_audio = kwargs.pop("src_audio_path", None) or p.str("src_audio_path") or None
             return GenerateMusicRequest(
                 prompt=p.str("prompt"),
                 lyrics=p.str("lyrics"),
@@ -2012,6 +2198,8 @@ def create_app() -> FastAPI:
                 repainting_end=p.float("repainting_end"),
                 instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
                 audio_cover_strength=p.float("audio_cover_strength", 1.0),
+                reference_audio_path=_validate_audio_path(ref_audio),
+                src_audio_path=_validate_audio_path(src_audio),
                 task_type=p.str("task_type", "text2music"),
                 use_adg=p.bool("use_adg"),
                 cfg_interval_start=p.float("cfg_interval_start", 0.0),
@@ -2067,13 +2255,13 @@ def create_app() -> FastAPI:
                 reference_audio_path = await _save_upload_to_temp(ref_up, prefix="ref_audio")
                 temp_files.append(reference_audio_path)
             else:
-                reference_audio_path = str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None
+                reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
 
             if isinstance(ctx_up, StarletteUploadFile):
                 src_audio_path = await _save_upload_to_temp(ctx_up, prefix="ctx_audio")
                 temp_files.append(src_audio_path)
             else:
-                src_audio_path = str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None
+                src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
 
             req = _build_request(
                 RequestParser(dict(form)),
@@ -2085,8 +2273,8 @@ def create_app() -> FastAPI:
             form = await request.form()
             form_dict = dict(form)
             verify_token_from_request(form_dict, authorization)
-            reference_audio_path = str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None
-            src_audio_path = str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None
+            reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
+            src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
             req = _build_request(
                 RequestParser(form_dict),
                 reference_audio_path=reference_audio_path,
@@ -2117,8 +2305,8 @@ def create_app() -> FastAPI:
                 parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
                 flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
                 verify_token_from_request(flat, authorization)
-                reference_audio_path = str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None
-                src_audio_path = str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None
+                reference_audio_path = _validate_audio_path(str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None)
+                src_audio_path = _validate_audio_path(str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None)
                 req = _build_request(
                     RequestParser(flat),
                     reference_audio_path=reference_audio_path,
@@ -2258,6 +2446,8 @@ def create_app() -> FastAPI:
                         "create_time": int(create_time), "env": env,
                         "prompt": "", "lyrics": "",
                         "metas": {},
+                        "progress": float(rec.progress) if rec else 0.0,
+                        "stage": rec.stage if rec else "queued",
                         "error": rec.error if rec.error else None,
                     }]
 
@@ -2418,7 +2608,7 @@ def create_app() -> FastAPI:
                     backend=backend,
                     device=lm_device,
                     offload_to_cpu=lm_offload,
-                    dtype=h.dtype,
+                    dtype=None,
                 )
                 if not ok:
                     app.state._llm_init_error = status

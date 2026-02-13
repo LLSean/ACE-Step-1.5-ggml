@@ -217,7 +217,9 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 tests/
+checkpoints
 checkpoints/
+Ace-Step1.5/
 playground.ipynb
 .history/
 upload_checkpoints.sh
@@ -242,3 +244,11 @@ proxy_config.txt
 gradio_outputs/
 acestep/third_parts/vllm/
 test_lora_scale_fix.py
+
+# Model files
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.gguf
+*.onnx

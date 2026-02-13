@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/ace_ggml_cli.dir/cpp/ace_ggml_cli.cpp.o -o ace_ggml_cli  -Wl,-rpath,/Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal libacestep_ggml.dylib

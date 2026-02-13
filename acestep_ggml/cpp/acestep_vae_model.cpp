@@ -4,11 +4,13 @@
 #include "safetensors.h"
 
 #include "ggml-cpu.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -121,6 +123,129 @@ static bool load_config(const std::string & path, Config & cfg, std::string & er
         cfg.hop_length *= r;
     }
     return true;
+}
+
+static std::string resolve_gguf_path(const std::string & dir) {
+    const char * keys[] = {
+        "ACE_GGML_VAE_GGUF",
+        "ACE_GGML_VAE_GGUF_PATH",
+    };
+    for (const char * key : keys) {
+        const char * value = std::getenv(key);
+        if (value && value[0] && std::filesystem::exists(value)) {
+            return std::string(value);
+        }
+    }
+
+    const std::filesystem::path p(dir);
+    if (p.extension() == ".gguf" && std::filesystem::exists(p)) {
+        return p.string();
+    }
+    if (std::filesystem::is_directory(p)) {
+        const std::filesystem::path candidate = p / "model.gguf";
+        if (std::filesystem::exists(candidate)) {
+            return candidate.string();
+        }
+    }
+    return "";
+}
+
+static bool load_gguf_file(
+    const std::string & path,
+    gguf_context * & out_gguf,
+    ggml_context * & out_gguf_ctx,
+    std::string & error) {
+
+    out_gguf = nullptr;
+    out_gguf_ctx = nullptr;
+
+    gguf_init_params params{};
+    params.no_alloc = false;
+    params.ctx = &out_gguf_ctx;
+
+    out_gguf = gguf_init_from_file(path.c_str(), params);
+    if (!out_gguf || !out_gguf_ctx) {
+        if (out_gguf) {
+            gguf_free(out_gguf);
+            out_gguf = nullptr;
+        }
+        if (out_gguf_ctx) {
+            ggml_free(out_gguf_ctx);
+            out_gguf_ctx = nullptr;
+        }
+        error = "failed to load gguf file: " + path;
+        return false;
+    }
+    return true;
+}
+
+static bool read_tensor_as_f32(
+    const ggml_tensor * src,
+    const std::string & name,
+    std::vector<float> & out,
+    std::string & error) {
+
+    if (!src || !src->data) {
+        error = "missing tensor data for " + name;
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(src);
+    if (n <= 0) {
+        error = "invalid tensor size for " + name;
+        return false;
+    }
+
+    out.resize(static_cast<size_t>(n));
+    if (src->type == GGML_TYPE_F32) {
+        std::memcpy(out.data(), src->data, static_cast<size_t>(n) * sizeof(float));
+        return true;
+    }
+    if (src->type == GGML_TYPE_BF16) {
+        const auto * p = static_cast<const ggml_bf16_t *>(src->data);
+        for (int64_t i = 0; i < n; ++i) {
+            out[static_cast<size_t>(i)] = ggml_bf16_to_fp32(p[i]);
+        }
+        return true;
+    }
+    if (src->type == GGML_TYPE_F16) {
+        const auto * p = static_cast<const ggml_fp16_t *>(src->data);
+        for (int64_t i = 0; i < n; ++i) {
+            out[static_cast<size_t>(i)] = ggml_fp16_to_fp32(p[i]);
+        }
+        return true;
+    }
+
+    error = "unsupported gguf tensor type for conversion: " + name;
+    return false;
+}
+
+static bool read_tensor_from_gguf(
+    ggml_context * gguf_ctx,
+    const std::string & name,
+    std::vector<int64_t> & shape,
+    std::vector<float> & data,
+    std::string & error) {
+
+    ggml_tensor * t = ggml_get_tensor(gguf_ctx, name.c_str());
+    if (!t) {
+        error = "missing tensor in gguf: " + name;
+        return false;
+    }
+
+    const int n_dims = ggml_n_dims(t);
+    if (n_dims <= 0 || n_dims > GGML_MAX_DIMS) {
+        error = "invalid tensor rank in gguf for " + name;
+        return false;
+    }
+
+    shape.clear();
+    shape.reserve(static_cast<size_t>(n_dims));
+    for (int i = n_dims - 1; i >= 0; --i) {
+        shape.push_back(t->ne[i]);
+    }
+
+    return read_tensor_as_f32(t, name, data, error);
 }
 
 static bool read_tensor_as_f32(
@@ -262,6 +387,26 @@ static bool load_tensor_1d_f32(
     return out != nullptr;
 }
 
+static bool load_tensor_1d_f32(
+    ggml_context * ctx,
+    ggml_context * gguf_ctx,
+    const std::string & name,
+    ggml_tensor * & out,
+    std::string & error) {
+
+    std::vector<int64_t> shape;
+    std::vector<float> data;
+    if (!read_tensor_from_gguf(gguf_ctx, name, shape, data, error)) {
+        return false;
+    }
+    if (shape.size() != 1) {
+        error = "invalid tensor shape for " + name;
+        return false;
+    }
+    out = make_tensor_1d_f32(ctx, name, shape[0], data, error);
+    return out != nullptr;
+}
+
 static bool load_tensor_3d_f32_reversed(
     ggml_context * ctx,
     const ace_safetensors::File & st,
@@ -287,25 +432,94 @@ static bool load_tensor_3d_f32_reversed(
     return out != nullptr;
 }
 
-static bool load_snake(
+static bool load_tensor_3d_f32_reversed(
     ggml_context * ctx,
-    const ace_safetensors::File & st,
-    const std::string & prefix,
-    Snake & out,
+    ggml_context * gguf_ctx,
+    const std::string & name,
+    ggml_tensor * & out,
     std::string & error) {
 
-    if (!load_tensor_3d_f32_reversed(ctx, st, prefix + ".alpha", out.alpha, error)) {
+    std::vector<int64_t> shape;
+    std::vector<float> data;
+    if (!read_tensor_from_gguf(gguf_ctx, name, shape, data, error)) {
         return false;
     }
-    if (!load_tensor_3d_f32_reversed(ctx, st, prefix + ".beta", out.beta, error)) {
+    if (shape.empty() || shape.size() > 3) {
+        error = "invalid tensor shape for " + name;
+        return false;
+    }
+    while (shape.size() < 3) {
+        shape.insert(shape.begin(), 1);
+    }
+    out = make_tensor_3d_f32(ctx, name, shape[2], shape[1], shape[0], data, error);
+    return out != nullptr;
+}
+
+static bool read_weight_norm_tensors(
+    const ace_safetensors::File & st,
+    const std::string & prefix,
+    std::vector<int64_t> & g_shape,
+    std::vector<float> & g_data,
+    std::vector<int64_t> & v_shape,
+    std::vector<float> & v_data,
+    std::string & error) {
+
+    const auto * info_g = st.find(prefix + ".weight_g");
+    const auto * info_v = st.find(prefix + ".weight_v");
+    if (!info_g || !info_v) {
+        error = "missing weight-norm tensors for " + prefix;
+        return false;
+    }
+    g_shape = info_g->shape;
+    v_shape = info_v->shape;
+    if (!read_tensor_as_f32(st, *info_g, g_data, error)) {
+        return false;
+    }
+    if (!read_tensor_as_f32(st, *info_v, v_data, error)) {
         return false;
     }
     return true;
 }
 
+static bool read_weight_norm_tensors(
+    ggml_context * gguf_ctx,
+    const std::string & prefix,
+    std::vector<int64_t> & g_shape,
+    std::vector<float> & g_data,
+    std::vector<int64_t> & v_shape,
+    std::vector<float> & v_data,
+    std::string & error) {
+
+    if (!read_tensor_from_gguf(gguf_ctx, prefix + ".weight_g", g_shape, g_data, error)) {
+        return false;
+    }
+    if (!read_tensor_from_gguf(gguf_ctx, prefix + ".weight_v", v_shape, v_data, error)) {
+        return false;
+    }
+    return true;
+}
+
+template <typename TensorSource>
+static bool load_snake(
+    ggml_context * ctx,
+    const TensorSource & src,
+    const std::string & prefix,
+    Snake & out,
+    std::string & error) {
+
+    if (!load_tensor_3d_f32_reversed(ctx, src, prefix + ".alpha", out.alpha, error)) {
+        return false;
+    }
+    if (!load_tensor_3d_f32_reversed(ctx, src, prefix + ".beta", out.beta, error)) {
+        return false;
+    }
+    return true;
+}
+
+template <typename TensorSource>
 static bool load_conv_weight_norm(
     ggml_context * ctx,
-    const ace_safetensors::File & st,
+    const TensorSource & src,
     const std::string & prefix,
     bool transposed,
     bool with_bias,
@@ -315,29 +529,21 @@ static bool load_conv_weight_norm(
     Conv1d & out,
     std::string & error) {
 
-    const auto * info_g = st.find(prefix + ".weight_g");
-    const auto * info_v = st.find(prefix + ".weight_v");
-    if (!info_g || !info_v) {
-        error = "missing weight-norm tensors for " + prefix;
+    std::vector<int64_t> g_shape;
+    std::vector<float> g_data;
+    std::vector<int64_t> v_shape;
+    std::vector<float> v_data;
+    if (!read_weight_norm_tensors(src, prefix, g_shape, g_data, v_shape, v_data, error)) {
         return false;
     }
-    if (info_v->shape.size() != 3 || info_g->shape.size() != 3) {
+    if (v_shape.size() != 3 || g_shape.size() != 3) {
         error = "invalid weight-norm tensor shape for " + prefix;
         return false;
     }
 
-    std::vector<float> g_data;
-    std::vector<float> v_data;
-    if (!read_tensor_as_f32(st, *info_g, g_data, error)) {
-        return false;
-    }
-    if (!read_tensor_as_f32(st, *info_v, v_data, error)) {
-        return false;
-    }
-
-    const int64_t d0 = info_v->shape[0];
-    const int64_t d1 = info_v->shape[1];
-    const int64_t d2 = info_v->shape[2];
+    const int64_t d0 = v_shape[0];
+    const int64_t d1 = v_shape[1];
+    const int64_t d2 = v_shape[2];
     if (static_cast<int64_t>(g_data.size()) != d0) {
         error = "weight_g size mismatch for " + prefix;
         return false;
@@ -369,7 +575,7 @@ static bool load_conv_weight_norm(
     }
 
     if (with_bias) {
-        if (!load_tensor_1d_f32(ctx, st, prefix + ".bias", out.bias, error)) {
+        if (!load_tensor_1d_f32(ctx, src, prefix + ".bias", out.bias, error)) {
             return false;
         }
     }
@@ -381,79 +587,82 @@ static bool load_conv_weight_norm(
     return true;
 }
 
+template <typename TensorSource>
 static bool load_residual_unit(
     ggml_context * ctx,
-    const ace_safetensors::File & st,
+    const TensorSource & src,
     const std::string & prefix,
     int32_t dilation,
     ResidualUnit & out,
     std::string & error) {
 
-    if (!load_snake(ctx, st, prefix + ".snake1", out.snake1, error)) {
+    if (!load_snake(ctx, src, prefix + ".snake1", out.snake1, error)) {
         return false;
     }
     const int32_t pad = ((7 - 1) * dilation) / 2;
-    if (!load_conv_weight_norm(ctx, st, prefix + ".conv1", false, true, 1, pad, dilation, out.conv1, error)) {
+    if (!load_conv_weight_norm(ctx, src, prefix + ".conv1", false, true, 1, pad, dilation, out.conv1, error)) {
         return false;
     }
-    if (!load_snake(ctx, st, prefix + ".snake2", out.snake2, error)) {
+    if (!load_snake(ctx, src, prefix + ".snake2", out.snake2, error)) {
         return false;
     }
-    if (!load_conv_weight_norm(ctx, st, prefix + ".conv2", false, true, 1, 0, 1, out.conv2, error)) {
+    if (!load_conv_weight_norm(ctx, src, prefix + ".conv2", false, true, 1, 0, 1, out.conv2, error)) {
         return false;
     }
     return true;
 }
 
+template <typename TensorSource>
 static bool load_decoder_block(
     ggml_context * ctx,
-    const ace_safetensors::File & st,
+    const TensorSource & src,
     const std::string & prefix,
     int32_t stride,
     DecoderBlock & out,
     std::string & error) {
 
-    if (!load_snake(ctx, st, prefix + ".snake1", out.snake1, error)) {
+    if (!load_snake(ctx, src, prefix + ".snake1", out.snake1, error)) {
         return false;
     }
     const int32_t pad = (stride + 1) / 2; // ceil(stride / 2)
-    if (!load_conv_weight_norm(ctx, st, prefix + ".conv_t1", true, true, stride, pad, 1, out.conv_t1, error)) {
+    if (!load_conv_weight_norm(ctx, src, prefix + ".conv_t1", true, true, stride, pad, 1, out.conv_t1, error)) {
         return false;
     }
-    if (!load_residual_unit(ctx, st, prefix + ".res_unit1", 1, out.res1, error)) {
+    if (!load_residual_unit(ctx, src, prefix + ".res_unit1", 1, out.res1, error)) {
         return false;
     }
-    if (!load_residual_unit(ctx, st, prefix + ".res_unit2", 3, out.res2, error)) {
+    if (!load_residual_unit(ctx, src, prefix + ".res_unit2", 3, out.res2, error)) {
         return false;
     }
-    if (!load_residual_unit(ctx, st, prefix + ".res_unit3", 9, out.res3, error)) {
+    if (!load_residual_unit(ctx, src, prefix + ".res_unit3", 9, out.res3, error)) {
         return false;
     }
     return true;
 }
 
+template <typename TensorSource>
 static bool load_encoder_block(
     ggml_context * ctx,
-    const ace_safetensors::File & st,
+    const TensorSource & src,
     const std::string & prefix,
     int32_t stride,
     EncoderBlock & out,
     std::string & error) {
 
-    if (!load_residual_unit(ctx, st, prefix + ".res_unit1", 1, out.res1, error)) {
+    if (!load_residual_unit(ctx, src, prefix + ".res_unit1", 1, out.res1, error)) {
         return false;
     }
-    if (!load_residual_unit(ctx, st, prefix + ".res_unit2", 3, out.res2, error)) {
+    if (!load_residual_unit(ctx, src, prefix + ".res_unit2", 3, out.res2, error)) {
         return false;
     }
-    if (!load_residual_unit(ctx, st, prefix + ".res_unit3", 9, out.res3, error)) {
+    if (!load_residual_unit(ctx, src, prefix + ".res_unit3", 9, out.res3, error)) {
         return false;
     }
-    if (!load_snake(ctx, st, prefix + ".snake1", out.snake1, error)) {
+    if (!load_snake(ctx, src, prefix + ".snake1", out.snake1, error)) {
         return false;
     }
     const int32_t pad = (stride + 1) / 2; // ceil(stride / 2)
-    if (!load_conv_weight_norm(ctx, st, prefix + ".conv1", false, true, stride, pad, 1, out.conv1, error)) {
+    if (!load_conv_weight_norm(ctx, src, prefix + ".conv1", false, true, stride, pad, 1, out.conv1, error)) {
         return false;
     }
     return true;
@@ -550,32 +759,68 @@ void free_model(Model & model) {
 }
 
 bool load_model_from_dir(const std::string & dir, Model & out, std::string & error) {
-    const std::string cfg_path = dir + "/config.json";
-    const std::string st_path = dir + "/diffusion_pytorch_model.safetensors";
+    const std::filesystem::path p(dir);
+    const bool input_is_gguf = p.extension() == ".gguf";
+    const std::filesystem::path model_root = input_is_gguf ? p.parent_path() : p;
+    const std::string cfg_path = (model_root / "config.json").string();
+    const std::string st_path = (model_root / "diffusion_pytorch_model.safetensors").string();
+    const std::string gguf_path = resolve_gguf_path(dir);
+    const bool use_gguf = !gguf_path.empty();
 
     Config cfg;
     if (!load_config(cfg_path, cfg, error)) {
         return false;
     }
 
+    gguf_context * gguf = nullptr;
+    ggml_context * gguf_ctx = nullptr;
     ace_safetensors::File st;
-    if (!st.load(st_path, error)) {
-        return false;
+    if (use_gguf) {
+        if (!load_gguf_file(gguf_path, gguf, gguf_ctx, error)) {
+            return false;
+        }
+    } else {
+        if (!st.load(st_path, error)) {
+            return false;
+        }
     }
 
     // Keep encoder/decoder tensors.
     size_t n_tensors = 0;
     size_t stored_bytes = 0;
-    for (const auto & info : st.tensors) {
-        if (!starts_with(info.name, "decoder.") && !starts_with(info.name, "encoder.")) {
-            continue;
+    if (use_gguf) {
+        const int64_t gguf_n_tensors = gguf_get_n_tensors(gguf);
+        for (int64_t i = 0; i < gguf_n_tensors; ++i) {
+            const char * tensor_name = gguf_get_tensor_name(gguf, i);
+            if (!tensor_name) {
+                continue;
+            }
+            const std::string name(tensor_name);
+            if (!starts_with(name, "decoder.") && !starts_with(name, "encoder.")) {
+                continue;
+            }
+            if (ends_with(name, ".weight_g")) {
+                continue;
+            }
+            ggml_tensor * t = ggml_get_tensor(gguf_ctx, tensor_name);
+            if (!t) {
+                continue;
+            }
+            stored_bytes += static_cast<size_t>(ggml_nelements(t)) * sizeof(float);
+            ++n_tensors;
         }
-        if (ends_with(info.name, ".weight_g")) {
-            continue;
+    } else {
+        for (const auto & info : st.tensors) {
+            if (!starts_with(info.name, "decoder.") && !starts_with(info.name, "encoder.")) {
+                continue;
+            }
+            if (ends_with(info.name, ".weight_g")) {
+                continue;
+            }
+            const int64_t n = numel(info.shape);
+            stored_bytes += static_cast<size_t>(n) * sizeof(float);
+            ++n_tensors;
         }
-        const int64_t n = numel(info.shape);
-        stored_bytes += static_cast<size_t>(n) * sizeof(float);
-        ++n_tensors;
     }
 
     const size_t overhead = ggml_tensor_overhead() * (n_tensors + 256);
@@ -583,6 +828,12 @@ bool load_model_from_dir(const std::string & dir, Model & out, std::string & err
 
     void * buffer = std::malloc(ctx_size);
     if (!buffer) {
+        if (gguf) {
+            gguf_free(gguf);
+        }
+        if (gguf_ctx) {
+            ggml_free(gguf_ctx);
+        }
         error = "failed to allocate VAE model buffer";
         return false;
     }
@@ -595,6 +846,12 @@ bool load_model_from_dir(const std::string & dir, Model & out, std::string & err
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
         std::free(buffer);
+        if (gguf) {
+            gguf_free(gguf);
+        }
+        if (gguf_ctx) {
+            ggml_free(gguf_ctx);
+        }
         error = "ggml_init failed for VAE model";
         return false;
     }
@@ -605,53 +862,94 @@ bool load_model_from_dir(const std::string & dir, Model & out, std::string & err
     model.ctx_buffer = buffer;
     model.ctx_buffer_size = ctx_size;
 
-    if (!load_conv_weight_norm(ctx, st, "encoder.conv1", false, true, 1, 3, 1, model.enc_conv1, error)) {
+    auto cleanup_source = [&]() {
+        if (gguf) {
+            gguf_free(gguf);
+            gguf = nullptr;
+        }
+        if (gguf_ctx) {
+            ggml_free(gguf_ctx);
+            gguf_ctx = nullptr;
+        }
+    };
+    auto fail = [&]() -> bool {
         free_model(model);
+        cleanup_source();
         return false;
+    };
+    auto load_conv = [&](const std::string & prefix,
+                         bool transposed,
+                         bool with_bias,
+                         int32_t stride,
+                         int32_t padding,
+                         int32_t dilation,
+                         Conv1d & dst) -> bool {
+        if (use_gguf) {
+            return load_conv_weight_norm(
+                ctx, gguf_ctx, prefix, transposed, with_bias, stride, padding, dilation, dst, error);
+        }
+        return load_conv_weight_norm(
+            ctx, st, prefix, transposed, with_bias, stride, padding, dilation, dst, error);
+    };
+    auto load_enc_block = [&](const std::string & prefix, int32_t stride, EncoderBlock & dst) -> bool {
+        if (use_gguf) {
+            return load_encoder_block(ctx, gguf_ctx, prefix, stride, dst, error);
+        }
+        return load_encoder_block(ctx, st, prefix, stride, dst, error);
+    };
+    auto load_dec_block = [&](const std::string & prefix, int32_t stride, DecoderBlock & dst) -> bool {
+        if (use_gguf) {
+            return load_decoder_block(ctx, gguf_ctx, prefix, stride, dst, error);
+        }
+        return load_decoder_block(ctx, st, prefix, stride, dst, error);
+    };
+    auto load_snk = [&](const std::string & prefix, Snake & dst) -> bool {
+        if (use_gguf) {
+            return load_snake(ctx, gguf_ctx, prefix, dst, error);
+        }
+        return load_snake(ctx, st, prefix, dst, error);
+    };
+
+    if (!load_conv("encoder.conv1", false, true, 1, 3, 1, model.enc_conv1)) {
+        return fail();
     }
     const size_t n_enc_blocks = cfg.downsampling_ratios.size();
     model.enc_blocks.resize(n_enc_blocks);
     for (size_t i = 0; i < n_enc_blocks; ++i) {
         std::string prefix = "encoder.block." + std::to_string(i);
-        if (!load_encoder_block(ctx, st, prefix, cfg.downsampling_ratios[i], model.enc_blocks[i], error)) {
-            free_model(model);
-            return false;
+        if (!load_enc_block(prefix, cfg.downsampling_ratios[i], model.enc_blocks[i])) {
+            return fail();
         }
     }
-    if (!load_snake(ctx, st, "encoder.snake1", model.enc_snake1, error)) {
-        free_model(model);
-        return false;
+    if (!load_snk("encoder.snake1", model.enc_snake1)) {
+        return fail();
     }
-    if (!load_conv_weight_norm(ctx, st, "encoder.conv2", false, true, 1, 1, 1, model.enc_conv2, error)) {
-        free_model(model);
-        return false;
+    if (!load_conv("encoder.conv2", false, true, 1, 1, 1, model.enc_conv2)) {
+        return fail();
     }
 
-    if (!load_conv_weight_norm(ctx, st, "decoder.conv1", false, true, 1, 3, 1, model.conv1, error)) {
-        free_model(model);
-        return false;
+    if (!load_conv("decoder.conv1", false, true, 1, 3, 1, model.conv1)) {
+        return fail();
     }
 
     const size_t n_blocks = cfg.upsampling_ratios.size();
     model.blocks.resize(n_blocks);
     for (size_t i = 0; i < n_blocks; ++i) {
         std::string prefix = "decoder.block." + std::to_string(i);
-        if (!load_decoder_block(ctx, st, prefix, cfg.upsampling_ratios[i], model.blocks[i], error)) {
-            free_model(model);
-            return false;
+        if (!load_dec_block(prefix, cfg.upsampling_ratios[i], model.blocks[i])) {
+            return fail();
         }
     }
 
-    if (!load_snake(ctx, st, "decoder.snake1", model.snake1, error)) {
-        free_model(model);
-        return false;
+    if (!load_snk("decoder.snake1", model.snake1)) {
+        return fail();
     }
-    if (!load_conv_weight_norm(ctx, st, "decoder.conv2", false, false, 1, 3, 1, model.conv2, error)) {
-        free_model(model);
-        return false;
+    if (!load_conv("decoder.conv2", false, false, 1, 3, 1, model.conv2)) {
+        return fail();
     }
 
     model.loaded = true;
+    cleanup_source();
     out = std::move(model);
     return true;
 }

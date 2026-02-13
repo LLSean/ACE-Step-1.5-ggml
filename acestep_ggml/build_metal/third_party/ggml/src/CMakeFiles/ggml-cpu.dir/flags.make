@@ -7,15 +7,11 @@ C_DEFINES = -DACCELERATE_LAPACK_ILP64 -DACCELERATE_NEW_LAPACK -DGGML_BACKEND_BUI
 
 C_INCLUDES = -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/.. -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/. -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/ggml-cpu -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/../include -F/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks
 
-C_FLAGSarm64 = -O3 -DNDEBUG -std=gnu11 -arch arm64 -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wdouble-promotion -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+i8mm+nosve+nosme
-
-C_FLAGS = -O3 -DNDEBUG -std=gnu11 -arch arm64 -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wdouble-promotion -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+i8mm+nosve+nosme
+C_FLAGS = -O3 -DNDEBUG -std=gnu11 -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wdouble-promotion -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+i8mm+nosve+nosme
 
 CXX_DEFINES = -DACCELERATE_LAPACK_ILP64 -DACCELERATE_NEW_LAPACK -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_MAX_NAME=128 -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_ACCELERATE -DGGML_USE_CPU_REPACK -D_DARWIN_C_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS
 
 CXX_INCLUDES = -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/.. -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/. -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/ggml-cpu -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/../include -F/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks
 
-CXX_FLAGSarm64 = -O3 -DNDEBUG -std=gnu++17 -arch arm64 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+i8mm+nosve+nosme
-
-CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -arch arm64 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+i8mm+nosve+nosme
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+i8mm+nosve+nosme
 

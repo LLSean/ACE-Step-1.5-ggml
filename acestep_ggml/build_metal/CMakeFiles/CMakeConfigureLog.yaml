@@ -1940,3 +1940,79 @@ events:
         
       exitCode: 2
 ...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/miniconda3/envs/ace-ggml-py311/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindOpenMP.cmake:333 (try_compile)"
+      - "/opt/miniconda3/envs/ace-ggml-py311/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindOpenMP.cmake:640 (_OPENMP_GET_FLAGS)"
+      - "third_party/ggml/src/ggml-cpu/CMakeLists.txt:71 (find_package)"
+      - "third_party/ggml/src/CMakeLists.txt:445 (ggml_add_cpu_backend_variant_impl)"
+    description: "Detecting C OpenMP compiler info"
+    directories:
+      source: "/Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-9ijUiP"
+      binary: "/Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-9ijUiP"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: ""
+      CMAKE_OSX_SYSROOT: ""
+    buildResult:
+      variable: "OpenMP_COMPILE_RESULT_C_Xclang fopenmp"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-9ijUiP'
+        
+        Run Build Command(s): /opt/miniconda3/envs/ace-ggml-py311/lib/python3.11/site-packages/cmake/data/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_02248/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_02248.dir/build.make CMakeFiles/cmTC_02248.dir/build
+        Building C object CMakeFiles/cmTC_02248.dir/OpenMPTryFlag.c.o
+        /usr/bin/cc   -Xclang -fopenmp -std=gnu11 -MD -MT CMakeFiles/cmTC_02248.dir/OpenMPTryFlag.c.o -MF CMakeFiles/cmTC_02248.dir/OpenMPTryFlag.c.o.d -o CMakeFiles/cmTC_02248.dir/OpenMPTryFlag.c.o -c /Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-9ijUiP/OpenMPTryFlag.c
+        /Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-9ijUiP/OpenMPTryFlag.c:2:10: fatal error: 'omp.h' file not found
+            2 | #include <omp.h>
+              |          ^~~~~~~
+        1 error generated.
+        make[2]: *** [CMakeFiles/cmTC_02248.dir/OpenMPTryFlag.c.o] Error 1
+        make[1]: *** [cmTC_02248/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/miniconda3/envs/ace-ggml-py311/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindOpenMP.cmake:333 (try_compile)"
+      - "/opt/miniconda3/envs/ace-ggml-py311/lib/python3.11/site-packages/cmake/data/share/cmake-4.2/Modules/FindOpenMP.cmake:640 (_OPENMP_GET_FLAGS)"
+      - "third_party/ggml/src/ggml-cpu/CMakeLists.txt:71 (find_package)"
+      - "third_party/ggml/src/CMakeLists.txt:445 (ggml_add_cpu_backend_variant_impl)"
+    description: "Detecting CXX OpenMP compiler info"
+    directories:
+      source: "/Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-jvKxjX"
+      binary: "/Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-jvKxjX"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: ""
+      CMAKE_OSX_SYSROOT: ""
+    buildResult:
+      variable: "OpenMP_COMPILE_RESULT_CXX_Xclang fopenmp"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-jvKxjX'
+        
+        Run Build Command(s): /opt/miniconda3/envs/ace-ggml-py311/lib/python3.11/site-packages/cmake/data/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_f98d5/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_f98d5.dir/build.make CMakeFiles/cmTC_f98d5.dir/build
+        Building CXX object CMakeFiles/cmTC_f98d5.dir/OpenMPTryFlag.cpp.o
+        /usr/bin/c++   -Xclang -fopenmp -std=gnu++17 -MD -MT CMakeFiles/cmTC_f98d5.dir/OpenMPTryFlag.cpp.o -MF CMakeFiles/cmTC_f98d5.dir/OpenMPTryFlag.cpp.o.d -o CMakeFiles/cmTC_f98d5.dir/OpenMPTryFlag.cpp.o -c /Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-jvKxjX/OpenMPTryFlag.cpp
+        /Users/fmh/project/ACE-Step-1.5/acestep_ggml/build_metal/CMakeFiles/CMakeScratch/TryCompile-jvKxjX/OpenMPTryFlag.cpp:2:10: fatal error: 'omp.h' file not found
+            2 | #include <omp.h>
+              |          ^~~~~~~
+        1 error generated.
+        make[2]: *** [CMakeFiles/cmTC_f98d5.dir/OpenMPTryFlag.cpp.o] Error 1
+        make[1]: *** [cmTC_f98d5/fast] Error 2
+        
+      exitCode: 2
+...

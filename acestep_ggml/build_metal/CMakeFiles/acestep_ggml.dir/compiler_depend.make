@@ -4011,7 +4011,8 @@ CMakeFiles/acestep_ggml.dir/cpp/acestep_vae_model.cpp.o: /Users/fmh/project/ACE-
   /Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/include/ggml-alloc.h \
   /Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/include/ggml-backend.h \
   /Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/include/ggml-cpu.h \
-  /Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/include/ggml.h
+  /Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/include/ggml.h \
+  /Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/include/gguf.h
 
 CMakeFiles/acestep_ggml.dir/cpp/json_min.cpp.o: /Users/fmh/project/ACE-Step-1.5/acestep_ggml/cpp/json_min.cpp \
   /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/Availability.h \

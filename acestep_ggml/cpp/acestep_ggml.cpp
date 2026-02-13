@@ -55,6 +55,8 @@ struct ace_ggml_context {
     ggml_cgraph * vae_decode_graph = nullptr;
     ggml_tensor * vae_decode_input = nullptr;
     ggml_tensor * vae_decode_output = nullptr;
+    std::vector<float> vae_decode_input_planar;
+    std::vector<float> vae_decode_backend_output;
     int32_t vae_decode_cached_frames = -1;
     size_t vae_decode_cached_graph_size = 0;
     bool vae_decode_graph_allocated = false;
@@ -410,12 +412,36 @@ static ace_toggle_mode ace_read_toggle_mode_env(const char * key, ace_toggle_mod
     return fallback;
 }
 
+static bool ace_metal_decode_requires_weight_map() {
+    return ace_read_toggle_mode_env("ACE_GGML_VAE_METAL_REQUIRE_WEIGHT_MAP", ace_toggle_mode::OFF) == ace_toggle_mode::ON;
+}
+
+static bool ace_allow_unsafe_vae_metal_decode() {
+    return ace_read_toggle_mode_env("ACE_GGML_ALLOW_UNSAFE_VAE_METAL", ace_toggle_mode::OFF) == ace_toggle_mode::ON;
+}
+
 static bool ace_should_use_metal_decode(ace_ggml_context * ctx) {
-    if (!ctx || !ctx->vae_backend_is_metal || !ctx->vae_sched || !ctx->vae_backend || !ctx->vae_weights_on_metal) {
+    if (!ctx || !ctx->vae_backend_is_metal || !ctx->vae_sched || !ctx->vae_backend || !ctx->vae_model_host_buffer) {
+        return false;
+    }
+    if (!ace_allow_unsafe_vae_metal_decode()) {
+        static bool warned_once = false;
+        const ace_toggle_mode requested = ace_read_toggle_mode_env("ACE_GGML_VAE_METAL_DECODE", ace_toggle_mode::OFF);
+        if (requested == ace_toggle_mode::ON && !warned_once) {
+            std::fprintf(
+                stderr,
+                "ace_ggml: ignore ACE_GGML_VAE_METAL_DECODE=on; set ACE_GGML_ALLOW_UNSAFE_VAE_METAL=1 to enable unsafe VAE metal decode\n");
+            warned_once = true;
+        }
+        return false;
+    }
+    // Stable-diffusion.cpp-style behavior: allow runtime backend execution even
+    // when model params stay on CPU buffers. Keep opt-in strict mode for regressions.
+    if (ace_metal_decode_requires_weight_map() && !ctx->vae_weights_on_metal) {
         return false;
     }
 
-    const ace_toggle_mode mode = ace_read_toggle_mode_env("ACE_GGML_VAE_METAL_DECODE", ace_toggle_mode::AUTO);
+    const ace_toggle_mode mode = ace_read_toggle_mode_env("ACE_GGML_VAE_METAL_DECODE", ace_toggle_mode::OFF);
     if (mode == ace_toggle_mode::OFF) {
         return false;
     }
@@ -455,7 +481,9 @@ static bool ace_should_use_metal_decode(ace_ggml_context * ctx) {
 }
 
 static bool ace_should_use_metal_dit(ace_ggml_context * ctx) {
-    if (!ctx || !ctx->vae_backend_is_metal || !ctx->dit_sched || !ctx->vae_backend || !ctx->dit_model_host_buffer) {
+    // Keep DiT backend gating strict for stability: scheduler path currently
+    // assumes metal-mapped model params for robust buffer assignment.
+    if (!ctx || !ctx->vae_backend_is_metal || !ctx->dit_sched || !ctx->vae_backend || !ctx->dit_weights_on_metal) {
         return false;
     }
 
@@ -503,16 +531,25 @@ ace_ggml_status ace_ggml_load_vae(ace_ggml_context * ctx, const char * model_dir
         return ACE_GGML_ERR_INVALID_ARG;
     }
 
-    auto has_vae_files = [](const std::string & dir) {
+    auto has_vae_config = [](const std::string & dir) {
         const std::filesystem::path p(dir);
-        return std::filesystem::exists(p / "config.json") &&
-               std::filesystem::exists(p / "diffusion_pytorch_model.safetensors");
+        const std::filesystem::path cfg_path = p / "config.json";
+        if (!std::filesystem::exists(cfg_path)) {
+            return false;
+        }
+        std::ifstream ifs(cfg_path);
+        if (!ifs) {
+            return false;
+        }
+        std::string cfg_text((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        return cfg_text.find("\"audio_channels\"") != std::string::npos &&
+               cfg_text.find("\"decoder_input_channels\"") != std::string::npos;
     };
 
     std::string vae_dir = model_dir;
-    if (!has_vae_files(vae_dir)) {
+    if (!has_vae_config(vae_dir)) {
         const std::string nested = vae_dir + "/vae";
-        if (has_vae_files(nested)) {
+        if (has_vae_config(nested)) {
             vae_dir = nested;
         }
     }
@@ -645,7 +682,6 @@ ace_ggml_status ace_ggml_vae_decode(
     const bool use_backend = ace_should_use_metal_decode(ctx);
     const bool profile = ace_env_enabled("ACE_GGML_VAE_PROFILE");
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> backend_output;
     ggml_context * compute_ctx = nullptr;
     ggml_context * graph_ctx = nullptr;
     ggml_tensor * out_f32 = nullptr;
@@ -755,21 +791,27 @@ ace_ggml_status ace_ggml_vae_decode(
         graph = ctx->vae_decode_graph;
         out_f32 = ctx->vae_decode_output;
 
-        std::vector<float> latents_planar(static_cast<size_t>(n_frames) * static_cast<size_t>(latent_channels));
+        const size_t planar_count = static_cast<size_t>(n_frames) * static_cast<size_t>(latent_channels);
+        if (ctx->vae_decode_input_planar.size() != planar_count) {
+            ctx->vae_decode_input_planar.resize(planar_count);
+        }
+        float * latents_planar = ctx->vae_decode_input_planar.data();
         for (int32_t t = 0; t < n_frames; ++t) {
             for (int32_t c = 0; c < latent_channels; ++c) {
                 latents_planar[static_cast<size_t>(t) + static_cast<size_t>(c) * static_cast<size_t>(n_frames)] =
                     latents[static_cast<size_t>(t) * static_cast<size_t>(latent_channels) + static_cast<size_t>(c)];
             }
         }
-        ggml_backend_tensor_set(ctx->vae_decode_input, latents_planar.data(), 0, latents_planar.size() * sizeof(float));
+        ggml_backend_tensor_set(ctx->vae_decode_input, latents_planar, 0, planar_count * sizeof(float));
         status = ggml_backend_sched_graph_compute(ctx->vae_sched, graph);
         if (status == GGML_STATUS_SUCCESS) {
             const int32_t copy_out_len = static_cast<int32_t>(out_f32->ne[0]);
             const int32_t copy_out_ch = static_cast<int32_t>(out_f32->ne[1]);
             const size_t copy_needed = static_cast<size_t>(copy_out_len) * static_cast<size_t>(copy_out_ch) * sizeof(float);
-            backend_output.resize(static_cast<size_t>(copy_out_len) * static_cast<size_t>(copy_out_ch));
-            ggml_backend_tensor_get(out_f32, backend_output.data(), 0, copy_needed);
+            if (ctx->vae_decode_backend_output.size() != static_cast<size_t>(copy_out_len) * static_cast<size_t>(copy_out_ch)) {
+                ctx->vae_decode_backend_output.resize(static_cast<size_t>(copy_out_len) * static_cast<size_t>(copy_out_ch));
+            }
+            ggml_backend_tensor_get(out_f32, ctx->vae_decode_backend_output.data(), 0, copy_needed);
         }
     } else {
         if (ctx->vae_compute_buffer.size() != ctx->compute_buffer_bytes) {
@@ -886,10 +928,10 @@ ace_ggml_status ace_ggml_vae_decode(
 
     const float * src = static_cast<const float *>(out_f32->data);
     if (use_backend) {
-        if (backend_output.empty()) {
+        if (ctx->vae_decode_backend_output.empty()) {
             return ace_set_error(ctx, ACE_GGML_ERR, "backend output copy is empty");
         }
-        src = backend_output.data();
+        src = ctx->vae_decode_backend_output.data();
     }
     for (int32_t t = 0; t < out_len; ++t) {
         for (int32_t c = 0; c < out_ch; ++c) {
@@ -930,7 +972,6 @@ ace_ggml_status ace_ggml_vae_decode(
     }
     return ACE_GGML_OK;
 }
-
 ace_ggml_status ace_ggml_vae_encode(
     ace_ggml_context * ctx,
     const float * audio,
@@ -1932,9 +1973,18 @@ static ace_ggml_status ace_generate_audio_from_encoder(
 
             if (!src_loaded) {
                 const int32_t encode_chunk_frames = ace_read_nonneg_env_int("ACE_GGML_VAE_ENCODE_CHUNK_FRAMES", 0);
-                const int32_t chunk_frames = (encode_chunk_frames > 0 && encode_chunk_frames < seq_len)
-                    ? encode_chunk_frames
-                    : seq_len;
+                int32_t chunk_frames = seq_len;
+                if (encode_chunk_frames > 0) {
+                    chunk_frames = std::max<int32_t>(1, std::min<int32_t>(encode_chunk_frames, seq_len));
+                } else {
+                    // Keep silence-latent encode memory bounded by default.
+                    // Environment overrides can still tune this value.
+                    int32_t auto_chunk_frames = ace_read_nonneg_env_int("ACE_GGML_VAE_ENCODE_CHUNK_FRAMES_AUTO", 0);
+                    if (auto_chunk_frames <= 0) {
+                        auto_chunk_frames = (seq_len > 128) ? 64 : seq_len;
+                    }
+                    chunk_frames = std::max<int32_t>(1, std::min<int32_t>(auto_chunk_frames, seq_len));
+                }
 
                 bool encode_ok = true;
                 for (int32_t frame0 = 0; frame0 < seq_len; frame0 += chunk_frames) {

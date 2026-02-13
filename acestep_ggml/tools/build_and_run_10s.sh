@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+GGML_SUBMODULE_DIR="${ROOT_DIR}/acestep_ggml/third_party/ggml"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/acestep_ggml/build}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 ENABLE_METAL="${ENABLE_METAL:-OFF}"
@@ -42,6 +43,12 @@ AUTO_SILENCE_TIMBRE="${AUTO_SILENCE_TIMBRE:-on}"
 
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/acestep_ggml/reports/outputs}"
 OUT_NAME="${OUT_NAME:-ggml_10s_style_lyric_timbre}"
+
+if [[ ! -f "${GGML_SUBMODULE_DIR}/CMakeLists.txt" ]]; then
+  echo "missing ggml submodule: ${GGML_SUBMODULE_DIR}" >&2
+  echo "run: git submodule update --init --recursive -- acestep_ggml/third_party/ggml" >&2
+  exit 1
+fi
 
 if [[ "${SKIP_BUILD}" != "1" ]]; then
   echo "[stage] configure+build start $(date +%H:%M:%S)"

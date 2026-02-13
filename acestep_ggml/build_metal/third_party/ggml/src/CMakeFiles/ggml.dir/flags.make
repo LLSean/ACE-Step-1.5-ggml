@@ -6,7 +6,5 @@ CXX_DEFINES = -DGGML_BACKEND_SHARED -DGGML_BUILD -DGGML_MAX_NAME=128 -DGGML_SCHE
 
 CXX_INCLUDES = -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/../include
 
-CXX_FLAGSarm64 = -O3 -DNDEBUG -std=gnu++17 -arch arm64 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi
-
-CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -arch arm64 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi
 

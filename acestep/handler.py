@@ -2737,7 +2737,13 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
         # Add custom timesteps if provided (convert to tensor)
         if timesteps is not None:
             generate_kwargs["timesteps"] = torch.tensor(timesteps, dtype=torch.float32, device=self.device)
-        dit_backend = "MLX (native)" if (self.use_mlx_dit and self.mlx_decoder is not None) else f"PyTorch ({self.device})"
+        ggml_dit_enabled = bool(getattr(self, "_ggml_dit_decoder_forward_hooked", False))
+        if self.use_mlx_dit and self.mlx_decoder is not None:
+            dit_backend = "MLX (native)"
+        elif ggml_dit_enabled:
+            dit_backend = "ggml-capi"
+        else:
+            dit_backend = f"PyTorch ({self.device})"
         logger.info(f"[service_generate] Generating audio... (DiT backend: {dit_backend})")
         with torch.inference_mode():
             with self._load_model_context("model"):
@@ -2814,7 +2820,10 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                         )
                         outputs = self.model.generate_audio(**generate_kwargs)
                 else:
-                    logger.info("[service_generate] DiT diffusion via PyTorch (%s)...", self.device)
+                    if ggml_dit_enabled:
+                        logger.info(f"[service_generate] DiT diffusion via ggml-capi (runtime device: {self.device})...")
+                    else:
+                        logger.info("[service_generate] DiT diffusion via PyTorch (%s)...", self.device)
                     outputs = self.model.generate_audio(**generate_kwargs)
         
         # Add intermediate information to outputs for extra_outputs

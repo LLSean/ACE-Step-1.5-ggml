@@ -6,7 +6,5 @@ CXX_DEFINES = -DACE_GGML_BUILD -DGGML_BACKEND_SHARED -DGGML_MAX_NAME=128 -DGGML_
 
 CXX_INCLUDES = -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/cpp -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/include -I/Users/fmh/project/ACE-Step-1.5/acestep_ggml/third_party/ggml/src/../include
 
-CXX_FLAGSarm64 = -O3 -DNDEBUG -std=gnu++17 -arch arm64 -fPIC
-
-CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -arch arm64 -fPIC
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIC
 
